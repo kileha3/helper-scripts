@@ -1,6 +1,7 @@
 #!/bin/bash
 set -e
 
+# Script: setup-mongo-docker.sh
 # Usage:
 # ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo [--project-dir /custom/path]
 
@@ -24,6 +25,23 @@ if [[ -z "$MONGO_USERNAME" || -z "$MONGO_PASSWORD" || -z "$HOST_PORT" || -z "$NU
   exit 1
 fi
 
+# --- Ensure vm.max_map_count is high enough for MongoDB ---
+REQUIRED_MAX_MAP_COUNT=524288
+CURRENT_MAX_MAP_COUNT=$(sysctl -n vm.max_map_count)
+if [[ "$CURRENT_MAX_MAP_COUNT" -lt "$REQUIRED_MAX_MAP_COUNT" ]]; then
+  echo "Setting vm.max_map_count to $REQUIRED_MAX_MAP_COUNT..."
+  sudo sysctl -w vm.max_map_count=$REQUIRED_MAX_MAP_COUNT
+
+  # Persist across reboots
+  if ! grep -q "vm.max_map_count" /etc/sysctl.conf; then
+    echo "vm.max_map_count=$REQUIRED_MAX_MAP_COUNT" | sudo tee -a /etc/sysctl.conf
+  else
+    sudo sed -i "s/^vm.max_map_count=.*/vm.max_map_count=$REQUIRED_MAX_MAP_COUNT/" /etc/sysctl.conf
+  fi
+else
+  echo "vm.max_map_count is already $CURRENT_MAX_MAP_COUNT, sufficient for MongoDB."
+fi
+
 # --- Setup directories ---
 if [[ -z "$PROJECT_DIR" ]]; then
   PROJECT_DIR="/var/www/core-mongo-db/$CONTAINER_NAME"
@@ -31,19 +49,35 @@ fi
 
 CONFIG_DIR="$PROJECT_DIR/configs"
 DATA_DIR_BASE="$PROJECT_DIR/data"
+KEYS_DIR="$PROJECT_DIR/keys"
 DOCKER_COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
 ENV_FILE="$PROJECT_DIR/.env"
 INIT_FILE="$CONFIG_DIR/mongo-init.js"
+KEY_FILE_HOST="$KEYS_DIR/mongo-keyfile"
 
-mkdir -p "$CONFIG_DIR"
-mkdir -p "$DATA_DIR_BASE"
+mkdir -p "$CONFIG_DIR" "$DATA_DIR_BASE" "$KEYS_DIR"
 
-# ensure project dir ownership by mongo user inside container
+# Generate key file if missing
+if [[ ! -f "$KEY_FILE_HOST" ]]; then
+  echo "Generating MongoDB keyfile..."
+  openssl rand -base64 756 > "$KEY_FILE_HOST"
+  chmod 400 "$KEY_FILE_HOST"
+fi
+
+# Ensure ownership for Docker
 sudo chown -R 999:999 "$PROJECT_DIR"
 
-# --- Remove existing containers matching the prefix ---
+# --- Remove existing containers safely ---
 echo "Removing existing containers with prefix $CONTAINER_NAME..."
-docker ps -a --filter "name=^${CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f
+EXISTING_CONTAINERS=$(docker ps -a --filter "name=^${CONTAINER_NAME}" --format "{{.Names}}")
+if [[ -n "$EXISTING_CONTAINERS" ]]; then
+  for c in $EXISTING_CONTAINERS; do
+    echo "Removing container $c..."
+    docker rm -f "$c" || true
+  done
+else
+  echo "No existing containers to remove."
+fi
 
 # --- Write .env ---
 cat > "$ENV_FILE" <<EOL
@@ -54,11 +88,12 @@ EOL
 
 # --- Docker compose ---
 cat > "$DOCKER_COMPOSE_FILE" <<EOL
-version: '3.9'
 services:
 EOL
 
 NETWORK_NAME="${CONTAINER_NAME}_network"
+
+declare -A CONTAINER_HOST_PORTS
 
 for i in $(seq 1 $NUM_CONTAINERS); do
   if [[ $NUM_CONTAINERS -eq 1 ]]; then
@@ -81,6 +116,8 @@ for i in $(seq 1 $NUM_CONTAINERS); do
   mkdir -p "$CONTAINER_DATA_DIR"
   sudo chown -R 999:999 "$CONTAINER_DATA_DIR"
 
+  CONTAINER_HOST_PORTS[$CONTAINER_INSTANCE_NAME]=$MAPPED_PORT
+
   cat >> "$DOCKER_COMPOSE_FILE" <<EOL
   $CONTAINER_INSTANCE_NAME:
     image: mongo:7.0
@@ -89,12 +126,14 @@ for i in $(seq 1 $NUM_CONTAINERS); do
       - "$MAPPED_PORT:27017"
     env_file:
       - $ENV_FILE
-    command: ["mongod", "--replSet", "\${REPLICA_SET_NAME}", "--auth"]
+    command: ["mongod", "--replSet", "\${REPLICA_SET_NAME}", "--auth", "--keyFile", "/etc/mongo-keyfile"]
     volumes:
       - $CONTAINER_DATA_DIR:/data/db
+      - $KEY_FILE_HOST:/etc/mongo-keyfile:ro
       $EXTRA_VOLUME
     networks:
       - $NETWORK_NAME
+    restart: unless-stopped
 
 EOL
 done
@@ -105,7 +144,7 @@ networks:
     driver: bridge
 EOL
 
-# --- Init script (master only) ---
+# --- Init script (master only, container names + internal ports) ---
 cat > "$INIT_FILE" <<EOL
 rs.initiate({
   _id: "rs_default",
@@ -113,19 +152,17 @@ rs.initiate({
 EOL
 
 for i in $(seq 1 $NUM_CONTAINERS); do
-  if [[ $NUM_CONTAINERS -eq 1 ]]; then
-    NAME="${CONTAINER_NAME}"
+  if [[ $i -eq 1 ]]; then
+    MEMBER_NAME="${CONTAINER_NAME}-master"
+    PRIORITY=2
   else
-    if [[ $i -eq 1 ]]; then
-      NAME="${CONTAINER_NAME}-master"
-    else
-      NAME="${CONTAINER_NAME}-rs$((i-1))"
-    fi
+    MEMBER_NAME="${CONTAINER_NAME}-rs$((i-1))"
+    PRIORITY=1
   fi
 
   COMMA=","
   if [[ $i -eq $NUM_CONTAINERS ]]; then COMMA=""; fi
-  echo "    { _id: $((i-1)), host: \"$NAME:27017\" }$COMMA" >> "$INIT_FILE"
+  echo "    { _id: $((i-1)), host: \"$MEMBER_NAME:27017\", priority: $PRIORITY }$COMMA" >> "$INIT_FILE"
 done
 
 cat >> "$INIT_FILE" <<EOL
@@ -144,9 +181,10 @@ else
 fi
 
 echo "Waiting for $MASTER_NAME to start..."
-RETRIES=20
+RETRIES=3
 until docker exec "$MASTER_NAME" mongosh -u "$MONGO_USERNAME" -p "$MONGO_PASSWORD" --authenticationDatabase admin --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
-  sleep 3
+  echo "Master not ready yet, waiting 20s..."
+  sleep 20
   ((RETRIES--))
   if [[ $RETRIES -le 0 ]]; then
     echo "Error: $MASTER_NAME did not start in time."
@@ -154,7 +192,7 @@ until docker exec "$MASTER_NAME" mongosh -u "$MONGO_USERNAME" -p "$MONGO_PASSWOR
   fi
 done
 
-# --- Initiate replica set if more than 1 node ---
+# --- Initiate replica set ---
 if [[ $NUM_CONTAINERS -eq 1 ]]; then
   CONNECTION_URL="mongodb://$MONGO_USERNAME:$MONGO_PASSWORD@localhost:$HOST_PORT/?authSource=admin"
   echo "MongoDB single instance running."
@@ -166,7 +204,11 @@ else
     } catch (e) {
       load('/docker-entrypoint-initdb.d/mongo-init.js')
     }"
-  CONNECTION_URL="mongodb://$MONGO_USERNAME:$MONGO_PASSWORD@localhost:$HOST_PORT/?replicaSet=rs_default&authSource=admin"
+  
+  # Connection string for host: just use master mapped port
+  CONNECTION_URL="mongodb://$MONGO_USERNAME:$MONGO_PASSWORD@localhost:$HOST_PORT/?authSource=admin"
+
   echo "MongoDB replica set with $NUM_CONTAINERS nodes running."
-  echo "Connection URL: $CONNECTION_URL"
+  echo "Use the following host connection string (maps to master container):"
+  echo "$CONNECTION_URL"
 fi
