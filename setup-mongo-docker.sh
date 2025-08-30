@@ -2,7 +2,7 @@
 set -e
 
 # Usage:
-# ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo --project-dir /custom/path
+# ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo [--project-dir /custom/path]
 
 # --- Parse named params ---
 while [[ "$#" -gt 0 ]]; do
@@ -20,13 +20,13 @@ done
 
 if [[ -z "$MONGO_USERNAME" || -z "$MONGO_PASSWORD" || -z "$HOST_PORT" || -z "$NUM_CONTAINERS" || -z "$CONTAINER_NAME" ]]; then
   echo "Missing required parameters"
-  echo "Usage: ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo [--project-dir /path/to/project]"
+  echo "Usage: ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo [--project-dir /custom/path]"
   exit 1
 fi
 
 # --- Setup directories ---
 if [[ -z "$PROJECT_DIR" ]]; then
-  PROJECT_DIR="/var/www/core-$CONTAINER_NAME"
+  PROJECT_DIR="/var/www/core-mongo-db/$CONTAINER_NAME"
 fi
 
 CONFIG_DIR="$PROJECT_DIR/configs"
@@ -41,6 +41,10 @@ mkdir -p "$DATA_DIR_BASE"
 # ensure project dir ownership by mongo user inside container
 sudo chown -R 999:999 "$PROJECT_DIR"
 
+# --- Remove existing containers matching the prefix ---
+echo "Removing existing containers with prefix $CONTAINER_NAME..."
+docker ps -a --filter "name=^${CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f
+
 # --- Write .env ---
 cat > "$ENV_FILE" <<EOL
 MONGO_INITDB_ROOT_USERNAME=$MONGO_USERNAME
@@ -48,7 +52,7 @@ MONGO_INITDB_ROOT_PASSWORD=$MONGO_PASSWORD
 REPLICA_SET_NAME=rs_default
 EOL
 
-# --- Write docker-compose.yml ---
+# --- Docker compose ---
 cat > "$DOCKER_COMPOSE_FILE" <<EOL
 version: '3.9'
 services:
@@ -67,7 +71,7 @@ for i in $(seq 1 $NUM_CONTAINERS); do
       MAPPED_PORT="$HOST_PORT"
       EXTRA_VOLUME="- $INIT_FILE:/docker-entrypoint-initdb.d/mongo-init.js:ro"
     else
-      CONTAINER_INSTANCE_NAME="${CONTAINER_NAME}-$i"
+      CONTAINER_INSTANCE_NAME="${CONTAINER_NAME}-rs$((i-1))"
       MAPPED_PORT=$((HOST_PORT + i - 1))
       EXTRA_VOLUME=""
     fi
@@ -101,7 +105,7 @@ networks:
     driver: bridge
 EOL
 
-# --- Write init script (used only by master) ---
+# --- Init script (master only) ---
 cat > "$INIT_FILE" <<EOL
 rs.initiate({
   _id: "rs_default",
@@ -115,7 +119,7 @@ for i in $(seq 1 $NUM_CONTAINERS); do
     if [[ $i -eq 1 ]]; then
       NAME="${CONTAINER_NAME}-master"
     else
-      NAME="${CONTAINER_NAME}-$i"
+      NAME="${CONTAINER_NAME}-rs$((i-1))"
     fi
   fi
 
@@ -140,8 +144,14 @@ else
 fi
 
 echo "Waiting for $MASTER_NAME to start..."
-until docker exec "$MASTER_NAME" mongosh --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
+RETRIES=20
+until docker exec "$MASTER_NAME" mongosh -u "$MONGO_USERNAME" -p "$MONGO_PASSWORD" --authenticationDatabase admin --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
   sleep 3
+  ((RETRIES--))
+  if [[ $RETRIES -le 0 ]]; then
+    echo "Error: $MASTER_NAME did not start in time."
+    exit 1
+  fi
 done
 
 # --- Initiate replica set if more than 1 node ---
@@ -150,7 +160,7 @@ if [[ $NUM_CONTAINERS -eq 1 ]]; then
   echo "MongoDB single instance running."
   echo "Connection URL: $CONNECTION_URL"
 else
-  docker exec "$MASTER_NAME" mongosh -u "$MONGO_USERNAME" -p "$MONGO_PASSWORD" --authenticationDatabase admin --eval "
+  docker exec "$MASTER_NAME" mongosh -u "$MONGO_USERNAME" -p "$MONGO_PASSWORD" --authenticationDatabase admin --quiet --eval "
     try {
       rs.status()
     } catch (e) {
