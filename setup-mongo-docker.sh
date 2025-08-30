@@ -2,7 +2,7 @@
 set -e
 
 # Usage:
-# ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo
+# ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo --project-dir /custom/path
 
 # --- Parse named params ---
 while [[ "$#" -gt 0 ]]; do
@@ -12,6 +12,7 @@ while [[ "$#" -gt 0 ]]; do
     --host-port) HOST_PORT="$2"; shift ;;
     --containers) NUM_CONTAINERS="$2"; shift ;;
     --container-name) CONTAINER_NAME="$2"; shift ;;
+    --project-dir) PROJECT_DIR="$2"; shift ;;
     *) echo "Unknown parameter passed: $1"; exit 1 ;;
   esac
   shift
@@ -19,12 +20,15 @@ done
 
 if [[ -z "$MONGO_USERNAME" || -z "$MONGO_PASSWORD" || -z "$HOST_PORT" || -z "$NUM_CONTAINERS" || -z "$CONTAINER_NAME" ]]; then
   echo "Missing required parameters"
-  echo "Usage: ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo"
+  echo "Usage: ./setup-mongo-docker.sh --username myuser --password mypass --host-port 27000 --containers 2 --container-name ubongo [--project-dir /path/to/project]"
   exit 1
 fi
 
 # --- Setup directories ---
-PROJECT_DIR="/var/www/core-mongo-db/$CONTAINER_NAME"
+if [[ -z "$PROJECT_DIR" ]]; then
+  PROJECT_DIR="/var/www/core-$CONTAINER_NAME"
+fi
+
 CONFIG_DIR="$PROJECT_DIR/configs"
 DATA_DIR_BASE="$PROJECT_DIR/data"
 DOCKER_COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
@@ -32,7 +36,10 @@ ENV_FILE="$PROJECT_DIR/.env"
 INIT_FILE="$CONFIG_DIR/mongo-init.js"
 
 mkdir -p "$CONFIG_DIR"
-[[ ! -d "$DATA_DIR_BASE" ]] && mkdir -p "$DATA_DIR_BASE"
+mkdir -p "$DATA_DIR_BASE"
+
+# ensure project dir ownership by mongo user inside container
+sudo chown -R 999:999 "$PROJECT_DIR"
 
 # --- Write .env ---
 cat > "$ENV_FILE" <<EOL
@@ -67,7 +74,8 @@ for i in $(seq 1 $NUM_CONTAINERS); do
   fi
 
   CONTAINER_DATA_DIR="$DATA_DIR_BASE/$CONTAINER_INSTANCE_NAME"
-  [[ ! -d "$CONTAINER_DATA_DIR" ]] && mkdir -p "$CONTAINER_DATA_DIR"
+  mkdir -p "$CONTAINER_DATA_DIR"
+  sudo chown -R 999:999 "$CONTAINER_DATA_DIR"
 
   cat >> "$DOCKER_COMPOSE_FILE" <<EOL
   $CONTAINER_INSTANCE_NAME:
